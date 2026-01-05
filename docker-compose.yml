@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  # --- BACKEND (Python) ---
+  backend:
+    build: ./backend
+    container_name: smarttrash-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    environment:
+      - WATCHFILES_FORCE_POLLING=true
+
+  # --- FRONTEND (React) ---
+  frontend:
+    build: ./frontend        # <--- ORA PUNTA ALLA CARTELLA GIUSTA
+    container_name: smarttrash-frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app      # <--- MAPPIAMO LA CARTELLA FRONTEND
+      - /app/node_modules    # <--- PROTEZIONE IMPORTANTE
+    depends_on:
+      - backend
+    environment:
+      - CHOKIDAR_USEPOLLING=true

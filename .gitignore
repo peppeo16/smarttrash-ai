@@ -1,7 +1,10 @@
-venv/
-.venv/
-backend/venv/
-backend/.venv/
+# .gitignore
+node_modules/
 __pycache__/
-*.pyc
+venv/
+.env
 .DS_Store
+dist/
+build/
+*.pyc
+debug_log.txt

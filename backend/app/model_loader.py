@@ -1,94 +1,162 @@
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Dict, Optional
+import io
+import numpy as np
+import tensorflow as tf
+from PIL import Image, ImageOps
 import os
-import random
+import logging
+# IMPORTANTE: Usiamo la funzione ufficiale di MobileNetV2 per la normalizzazione
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
-# Classi finali del progetto (5 bidoni)
-POSSIBLE_BINS = ("PLASTICA", "CARTA", "VETRO", "UMIDO", "INDIFFERENZIATO")
+# ==========================================
+# 1. CONFIGURAZIONE LOGGING
+# ==========================================
+logging.basicConfig(
+    filename='debug_log.txt', 
+    level=logging.INFO, 
+    format='%(asctime)s - %(message)s',
+    datefmt='%H:%M:%S',
+    force=True
+)
 
-# Cache del modello (lazy-load)
-_model: Optional[object] = None
+# ==========================================
+# 2. CONFIGURAZIONE MODELLO
+# ==========================================
+IMG_SIZE = (224, 224)
+MODEL_PATH = "app/models/best_model.h5"
 
-# Percorso modello (default) + override via env
-# Esempio: export SMARTTRASH_MODEL_PATH="/path/al/modello.h5"
-DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[2] / "model" / "saved_model.h5"
-MODEL_PATH = Path(os.getenv("SMARTTRASH_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
+# ORDINE DELLE CLASSI (Alfabetico)
+CLASS_NAMES = ['cardboard', 'glass', 'metal', 'paper', 'plastic', 'trash']
 
+# Mappatura semplice
+LABEL_MAP = {
+    'cardboard': 'CARTA',
+    'paper':     'CARTA',
+    'glass':     'VETRO',
+    'plastic':   'PLASTICA',
+    'metal':     'PLASTICA',
+    'trash':     'INDIFFERENZIATO'
+}
 
-def get_model() -> Optional[object]:
-    """
-    Carica e ritorna il modello (lazy).
-    Se non disponibile, ritorna None (il backend userà il mock).
-    """
-    global _model
-    if _model is not None:
-        return _model
-
-    if not MODEL_PATH.exists():
-        return None
-
-    # TODO: scegliete UNO tra TensorFlow o PyTorch, non entrambi.
-    # Qui assumo .h5 / Keras
-    try:
-        from tensorflow import keras  # import pesante: solo se serve
-        _model = keras.models.load_model(str(MODEL_PATH))
-        return _model
-    except Exception:
-        # Se il load fallisce, evitiamo di rompere il backend
-        return None
-
-
-def predict_mock(_: bytes) -> Dict:
-    """Fallback: ritorna una classe casuale + confidence fissa (solo demo)."""
-    bin_choice = random.choice(POSSIBLE_BINS)
-    material_map = {
-        "PLASTICA": "plastica",
-        "CARTA": "carta",
-        "VETRO": "vetro",
-        "UMIDO": "umido",
-        "INDIFFERENZIATO": "indifferenziato",
+# Mappatura dettagliata per il Frontend
+INFO_MAP = {
+    'cardboard': {
+        "bin": "CARTA", 
+        "it": "Cartone", 
+        "color": "#3498db", 
+        "tip": "Appiattisci le scatole per risparmiare spazio."
+    },
+    'paper': {
+        "bin": "CARTA", 
+        "it": "Carta", 
+        "color": "#3498db", 
+        "tip": "Assicurati che sia pulita e senza cibo."
+    },
+    'glass': {
+        "bin": "VETRO", 
+        "it": "Vetro", 
+        "color": "#2ecc71", 
+        "tip": "Rimuovi il tappo (va nella plastica o metallo)."
+    },
+    'plastic': {
+        "bin": "PLASTICA", 
+        "it": "Plastica", 
+        "color": "#f1c40f", 
+        "tip": "Schiaccia la bottiglia per il lato lungo."
+    },
+    'metal': {
+        "bin": "PLASTICA/METALLO", 
+        "it": "Metallo", 
+        "color": "#f1c40f", 
+        "tip": "Sciacqua le lattine prima di buttarle."
+    },
+    'trash': {
+        "bin": "INDIFFERENZIATO", 
+        "it": "Non Riciclabile", 
+        "color": "#7f8c8d", 
+        "tip": "Se hai dubbi, meglio nell'indifferenziato che sbagliare."
     }
-    return {"material": material_map[bin_choice], "bin": bin_choice, "confidence": 0.80}
+}
 
+_model = None
 
-def predict(img_bytes: bytes) -> Dict:
-    """
-    Entry point usata dal backend.
-    Se il modello non c'è -> mock.
-    """
-    model = get_model()
-    if model is None:
-        return predict_mock(img_bytes)
+def load_model():
+    global _model
+    logging.info(f"🔄 Tentativo caricamento modello da: {MODEL_PATH}")
+    
+    if os.path.exists(MODEL_PATH):
+        try:
+            # compile=False velocizza il caricamento
+            _model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+            logging.info("✅ MODELLO MOBILENET V2 CARICATO CON SUCCESSO!")
+        except Exception as e:
+            logging.error(f"❌ CRASH caricamento modello: {str(e)}")
+    else:
+        logging.error(f"❌ ERRORE: File {MODEL_PATH} non trovato.")
 
-    # Qui sotto: implementazione reale MINIMA (da adattare al vostro training)
-    # Assunzioni:
-    # - input immagine 224x224 RGB
-    # - output: probabilità per 5 classi in ordine POSSIBLE_BINS
+def predict(image_bytes: bytes) -> dict:
+    global _model
+    
+    logging.info("\n--- 📸 NUOVA RICHIESTA ANALISI ---")
+    
+    if _model is None: 
+        return {"error": "Modello non caricato. Controlla i log."}
+
     try:
-        from PIL import Image
-        import numpy as np
+        # 1. Apertura Immagine
+        img = Image.open(io.BytesIO(image_bytes))
+        
+        # 2. Correzione Orientamento (Exif)
+        img = ImageOps.exif_transpose(img)
+        
+        # 3. Conversione RGB
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        
+        # 4. Resize
+        img = img.resize(IMG_SIZE)
+        
+        # 5. Pre-processing MobileNetV2
+        img_array = np.array(img)
+        img_processed = preprocess_input(img_array)
+        img_batch = np.expand_dims(img_processed, axis=0)
 
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img = img.resize((224, 224))
-        x = np.array(img, dtype=np.float32) / 255.0
-        x = np.expand_dims(x, axis=0)
+        # 6. Predizione
+        predictions = _model.predict(img_batch)
+        probs = predictions[0]
 
-        preds = model.predict(x)[0]  # shape (5,)
-        class_id = int(np.argmax(preds))
-        confidence = float(preds[class_id])
+        # 7. Log Risultati
+        logging.info("📊 Risultati Analisi:")
+        for i, class_name in enumerate(CLASS_NAMES):
+            perc = probs[i] * 100
+            marker = " << VINCENTE" if perc == max(probs*100) else ""
+            logging.info(f"   • {class_name.upper().ljust(10)}: {perc:.2f}% {marker}")
+        
+        # 8. Risultato Finale
+        predicted_index = np.argmax(probs)
+        confidence = float(probs[predicted_index])
+        raw_label = CLASS_NAMES[predicted_index]
 
-        bin_choice = POSSIBLE_BINS[class_id]
-        material_map = {
-            "PLASTICA": "plastica",
-            "CARTA": "carta",
-            "VETRO": "vetro",
-            "UMIDO": "umido",
-            "INDIFFERENZIATO": "indifferenziato",
-        }
-        return {"material": material_map[bin_choice], "bin": bin_choice, "confidence": confidence}
+        info = INFO_MAP.get(raw_label)
+        
+        # Costruzione Risposta
+        if info:
+            return {
+                "material": info["it"],
+                "bin": info["bin"],
+                "tip": info["tip"],
+                "color": info["color"],
+                "confidence": round(confidence, 2)
+            }
+        else:
+            return {
+                "material": raw_label,
+                "bin": "INDIFFERENZIATO",
+                "tip": "Nessun consiglio disponibile",
+                "color": "#999999",
+                "confidence": round(confidence, 2)
+            }
 
-    except Exception:
-        # Se qualcosa va storto, NON crashiamo tutto: fallback mock
-        return predict_mock(img_bytes)
+    except Exception as e:
+        logging.error(f"❌ Errore durante la predizione: {str(e)}")
+        # Importante: restituiamo un dizionario con l'errore, NON None
+        return {"error": str(e)}
